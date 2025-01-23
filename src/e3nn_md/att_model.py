@@ -51,6 +51,7 @@ class Attention(torch.nn.Module):
         number_of_edge_features: int,
         radial_layers: int,
         radial_neurons: int,
+        layer_normalize: bool = True,
     ) -> None:
         super().__init__()
         self.irreps_in = irreps_in
@@ -61,6 +62,8 @@ class Attention(torch.nn.Module):
 
         self.irreps_node_attr = irreps_node_attr
         self.irreps_edge_attr = irreps_edge_attr
+
+        self.layer_normalize = layer_normalize
 
         self.sc = FullyConnectedTensorProduct(self.irreps_in, self.irreps_node_attr, self.irreps_value)
 
@@ -89,7 +92,8 @@ class Attention(torch.nn.Module):
 
         self.dot = FullyConnectedTensorProduct(self.irreps_query, self.irreps_key, "0e")
 
-        # self.norm = nn.LayerNorm(self.irreps_value.dim)
+        if self.layer_normalize:
+            self.norm = nn.LayerNorm(self.irreps_value.dim)
 
     def forward(
         self,
@@ -110,6 +114,8 @@ class Attention(torch.nn.Module):
         k = self.tp_k(node_input[edge_src], edge_sh, self.fc_k(edge_features))
         v = self.tp_v(node_input[edge_src], edge_sh, self.fc_v(edge_features))
 
+        k = k.div(k.shape[-1] ** 0.5)
+        # print(k.shape, q.shape, v.shape)
         exp = edge_weight_cutoff[:, None] * self.dot(q[edge_dst], k).exp()
         z = scatter(exp, edge_dst, dim=0, dim_size=len(node_input))
         z[z == 0] = 1
@@ -117,8 +123,11 @@ class Attention(torch.nn.Module):
         # print(v.shape, alpha.shape)
 
         node_out = node_update + scatter(alpha.relu().sqrt() * v, edge_dst, dim=0, dim_size=len(node_input))
-        return node_out
-        # return self.norm(node_out)
+        # return node_out
+        if self.layer_normalize:
+            return self.norm(node_out)
+        else:
+            return node_out
 
 
 # @compile_mode("script")
@@ -359,14 +368,14 @@ class Network(torch.nn.Module):
 
         irreps = self.irreps_in if self.irreps_in is not None else o3.Irreps("0e")
 
-        act = {
-            1: torch.nn.functional.silu,
-            -1: torch.tanh,
-        }
-        act_gates = {
-            1: torch.sigmoid,
-            -1: torch.tanh,
-        }
+        # act = {
+        #     1: torch.nn.functional.silu,
+        #     -1: torch.tanh,
+        # }
+        # act_gates = {
+        #     1: torch.sigmoid,
+        #     -1: torch.tanh,
+        # }
 
         if self.node_attr_emb_dim:
             assert self.node_attr_n_kind is not None
@@ -387,44 +396,45 @@ class Network(torch.nn.Module):
         #     )
         # )
         for _ in range(layers):
-            irreps_scalars = o3.Irreps(
-                [
-                    (mul, ir)
-                    for mul, ir in self.irreps_hidden
-                    if ir.l == 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
-                ]
-            )
-            irreps_gated = o3.Irreps(
-                [
-                    (mul, ir)
-                    for mul, ir in self.irreps_hidden
-                    if ir.l > 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
-                ]
-            )
-            ir = "0e" if tp_path_exists(irreps, self.irreps_edge_attr, "0e") else "0o"
-            irreps_gates = o3.Irreps([(mul, ir) for mul, _ in irreps_gated])
+            # irreps_scalars = o3.Irreps(
+            #     [
+            #         (mul, ir)
+            #         for mul, ir in self.irreps_hidden
+            #         if ir.l == 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
+            #     ]
+            # )
+            # irreps_gated = o3.Irreps(
+            #     [
+            #         (mul, ir)
+            #         for mul, ir in self.irreps_hidden
+            #         if ir.l > 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
+            #     ]
+            # )
+            # ir = "0e" if tp_path_exists(irreps, self.irreps_edge_attr, "0e") else "0o"
+            # irreps_gates = o3.Irreps([(mul, ir) for mul, _ in irreps_gated])
 
-            gate = Gate(
-                irreps_scalars,
-                [act[ir.p] for _, ir in irreps_scalars],  # scalar
-                irreps_gates,
-                [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
-                irreps_gated,  # gated tensors
-            )
+            # gate = Gate(
+            #     irreps_scalars,
+            #     [act[ir.p] for _, ir in irreps_scalars],  # scalar
+            #     irreps_gates,
+            #     [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
+            #     irreps_gated,  # gated tensors
+            # )
             att = Attention(
                 irreps,
                 self.irreps_query,
                 self.irreps_key,
-                gate.irreps_in,  # value self.irreps_value,
+                self.irreps_hidden,  # gate.irreps_in,  # value self.irreps_value,
                 self.irreps_node_attr,
                 self.irreps_edge_attr,
                 number_of_edge_features,
                 radial_layers,
                 radial_neurons,
             )
-            # self.layers.append(att)
-            irreps = gate.irreps_out
-            self.layers.append(Compose(att, gate))
+            irreps = self.irreps_hidden
+            self.layers.append(att)
+            # irreps = gate.irreps_out
+            # self.layers.append(Compose(att, gate))
 
         self.att_lay = Attention(
             irreps,
@@ -436,6 +446,7 @@ class Network(torch.nn.Module):
             number_of_edge_features,
             radial_layers,
             radial_neurons,
+            layer_normalize=False,
         )
 
     def forward(
@@ -544,7 +555,7 @@ class e3nn_md_module(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.weight_fill = weight_fill
+        # self.weight_fill = weight_fill
         self.model = Network(**model_kwargs)
 
         self.lr = lr
