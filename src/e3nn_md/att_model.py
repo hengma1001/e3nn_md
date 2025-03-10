@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 import lightning as L
 import torch
 import torch.nn.functional as F
+from click import Option
 from e3nn import o3
 from e3nn.math import soft_one_hot_linspace, soft_unit_step
 from e3nn.nn import ExtractIr, FullyConnectedNet, Gate
@@ -19,14 +20,6 @@ from e3nn.util.jit import compile_mode
 from torch import nn
 from torch_geometric.nn.pool import radius_graph
 from torch_scatter import scatter
-from traitlets import Bool
-
-# def radius_graph(pos, r_max, batch) -> torch.Tensor:
-#     # naive and inefficient version of torch_cluster.radius_graph
-#     r = torch.cdist(pos, pos)
-#     index = ((r < r_max) & (r > 0)).nonzero().T
-#     index = index[:, batch[index[0]] == batch[index[1]]]
-#     return index
 
 
 # @compile_mode("script")
@@ -122,7 +115,14 @@ class Attention(torch.nn.Module):
         alpha = exp / z[edge_dst]
         # print(v.shape, alpha.shape)
 
-        node_out = node_update + scatter(alpha.relu().sqrt() * v, edge_dst, dim=0, dim_size=len(node_input))
+        # node_out = node_update + scatter(alpha.relu().sqrt() * v, edge_dst, dim=0, dim_size=len(node_input))
+        node_out = scatter(alpha.relu().sqrt() * v, edge_dst, dim=0, dim_size=len(node_input))
+
+        c_s, c_x = math.sin(math.pi / 8), math.cos(math.pi / 8)
+        m = self.sc.output_mask
+        c_x = (1 - m) + c_x * m
+        node_out = c_s * node_update + c_x * node_out
+
         # return node_out
         if self.layer_normalize:
             return self.norm(node_out)
@@ -130,108 +130,70 @@ class Attention(torch.nn.Module):
             return node_out
 
 
-# @compile_mode("script")
-class Convolution(torch.nn.Module):
-    r"""equivariant convolution
-
-    Parameters
-    ----------
-    irreps_in : `e3nn.o3.Irreps`
-        representation of the input node features
-
-    irreps_node_attr : `e3nn.o3.Irreps`
-        representation of the node attributes
-
-    irreps_edge_attr : `e3nn.o3.Irreps`
-        representation of the edge attributes
-
-    irreps_out : `e3nn.o3.Irreps` or None
-        representation of the output node features
-
-    number_of_edge_features : int
-        number of scalar (0e) features of the edge used to feed the FC network
-
-    radial_layers : int
-        number of hidden layers in the radial fully connected network
-
-    radial_neurons : int
-        number of neurons in the hidden layers of the radial fully connected network
-
-    num_neighbors : float
-        typical number of nodes convolved over
-    """
-
+class MultiHeadGraphAttention(torch.nn.Module):
     def __init__(
         self,
         irreps_in: o3.Irreps,
+        irreps_query: o3.Irreps,
+        irreps_key: o3.Irreps,
+        irreps_value: o3.Irreps,
         irreps_node_attr: o3.Irreps,
         irreps_edge_attr: o3.Irreps,
-        irreps_out: Optional[o3.Irreps],
+        # irreps_out: o3.Irreps,
         number_of_edge_features: int,
         radial_layers: int,
         radial_neurons: int,
-        num_neighbors: float,
+        layer_normalize: bool = True,
+        n_heads: int = 1,
     ) -> None:
         super().__init__()
-        self.irreps_in = o3.Irreps(irreps_in)
-        self.irreps_node_attr = o3.Irreps(irreps_node_attr)
-        self.irreps_edge_attr = o3.Irreps(irreps_edge_attr)
-        self.irreps_out = o3.Irreps(irreps_out)
-        self.num_neighbors = num_neighbors
+        self.irreps_in = irreps_in
+        self.head_list = torch.nn.ModuleList()
 
-        self.sc = FullyConnectedTensorProduct(self.irreps_in, self.irreps_node_attr, self.irreps_out)
+        for i in range(n_heads):
+            self.head_list.append(
+                Attention(
+                    irreps_in,
+                    irreps_query,
+                    irreps_key,
+                    irreps_value,  # irreps_gated,  # gate.irreps_in,  # value irreps_value,
+                    irreps_node_attr,
+                    irreps_edge_attr,
+                    number_of_edge_features,
+                    radial_layers,
+                    radial_neurons,
+                    layer_normalize,
+                )
+            )
 
-        self.lin1 = FullyConnectedTensorProduct(self.irreps_in, self.irreps_node_attr, self.irreps_in)
+        self.lin1 = o3.Linear(irreps_value * n_heads, irreps_value)
 
-        irreps_mid = []
-        instructions = []
-        for i, (mul, ir_in) in enumerate(self.irreps_in):
-            for j, (_, ir_edge) in enumerate(self.irreps_edge_attr):
-                for ir_out in ir_in * ir_edge:
-                    if ir_out in self.irreps_out:
-                        k = len(irreps_mid)
-                        irreps_mid.append((mul, ir_out))
-                        instructions.append((i, j, k, "uvu", True))
-        irreps_mid = o3.Irreps(irreps_mid)
-        irreps_mid, p, _ = irreps_mid.sort()
-
-        instructions = [(i_1, i_2, p[i_out], mode, train) for i_1, i_2, i_out, mode, train in instructions]
-
-        tp = TensorProduct(
-            self.irreps_in,
-            self.irreps_edge_attr,
-            irreps_mid,
-            instructions,
-            internal_weights=False,
-            shared_weights=False,
-        )
-        self.fc = FullyConnectedNet(
-            [number_of_edge_features] + radial_layers * [radial_neurons] + [tp.weight_numel],
-            torch.nn.functional.silu,
-        )
-        self.tp = tp
-        self.layer_norm = torch.layer_norm(irreps_mid.dim)
-
-        self.lin2 = FullyConnectedTensorProduct(irreps_mid, self.irreps_node_attr, self.irreps_out)
-
-    def forward(self, node_input, node_attr, edge_src, edge_dst, edge_attr, edge_features) -> torch.Tensor:
-        weight = self.fc(edge_features)
-
-        x = node_input
-
-        s = self.sc(x, node_attr)
-        x = self.lin1(x, node_attr)
-
-        edge_features = self.tp(x[edge_src], edge_attr, weight)
-        x = scatter(edge_features, edge_dst, dim_size=x.shape[0]).div(self.num_neighbors**0.5)
-
-        x = self.layer_norm(x)
-        x = self.lin2(x, node_attr)
-
-        c_s, c_x = math.sin(math.pi / 8), math.cos(math.pi / 8)
-        m = self.sc.output_mask
-        c_x = (1 - m) + c_x * m
-        return c_s * s + c_x * x
+    def forward(
+        self,
+        node_input,
+        node_attr,
+        edge_src,
+        edge_dst,
+        edge_sh,
+        edge_features,
+        edge_weight_cutoff,
+    ) -> torch.Tensor:
+        head_outputs = []
+        for head in self.head_list:
+            head_outputs.append(
+                head(
+                    node_input,
+                    node_attr,
+                    edge_src,
+                    edge_dst,
+                    edge_sh,
+                    edge_features,
+                    edge_weight_cutoff,
+                )
+            )
+        x = torch.cat(head_outputs, 1)
+        x = self.lin1(x)
+        return x
 
 
 def smooth_cutoff(x):
@@ -317,26 +279,26 @@ class Network(torch.nn.Module):
 
     def __init__(
         self,
-        irreps_in: o3.Irreps | str,
-        irreps_query: o3.Irreps | str,
-        irreps_key: o3.Irreps | str,
-        irreps_value: o3.Irreps | str,
-        irreps_hidden: o3.Irreps | str,
-        irreps_out: o3.Irreps | str,
-        irreps_node_attr: o3.Irreps | str,
-        irreps_edge_attr: o3.Irreps | int,
-        layers: int,
-        max_radius: float,
-        number_of_basis: int,
-        radial_layers: int,
-        radial_neurons: int,
-        num_neighbors: float,
-        num_nodes: float,
+        irreps_in: Optional[str],
+        irreps_query: str,
+        irreps_key: str,
+        irreps_value: str,
+        irreps_hidden: str,
+        irreps_out: str,
+        irreps_node_attr: str,
+        irreps_edge_attr: int,
+        n_heads: int = 1,
+        layers: int = 1,
+        max_radius: float = 1.0,
+        number_of_basis: int = 20,
+        radial_layers: int = 1,
+        radial_neurons: int = 128,
+        num_neighbors: float = 20,
+        num_nodes: float = 20,
         node_attr_n_kind: Optional[int] = None,
         node_attr_emb_dim: Optional[int] = None,
-        time_emb_dim: Optional[int] = None,
-        radius_decay: Optional[float] = None,
         reduce_output: bool = True,
+        use_esm_embeddings: bool = False,
     ) -> None:
         super().__init__()
         self.max_radius = max_radius
@@ -345,8 +307,7 @@ class Network(torch.nn.Module):
         self.num_nodes = num_nodes
         self.node_attr_n_kind = node_attr_n_kind
         self.node_attr_emb_dim = node_attr_emb_dim
-        self.time_emb_dim = time_emb_dim
-        self.radius_decay = radius_decay
+        self.n_heads = n_heads
         self.reduce_output = reduce_output
 
         self.irreps_in = o3.Irreps(irreps_in) if irreps_in is not None else None
@@ -357,6 +318,8 @@ class Network(torch.nn.Module):
         self.irreps_out = o3.Irreps(irreps_out)
 
         self.irreps_node_attr = o3.Irreps(irreps_node_attr) if irreps_node_attr is not None else o3.Irreps("0e")
+        if use_esm_embeddings:
+            self.irreps_node_attr = self.irreps_node_attr + o3.Irreps("1280x0e")
 
         self.irreps_edge_attr = o3.Irreps.spherical_harmonics(irreps_edge_attr)
 
@@ -368,90 +331,82 @@ class Network(torch.nn.Module):
 
         irreps = self.irreps_in if self.irreps_in is not None else o3.Irreps("0e")
 
-        # act = {
-        #     1: torch.nn.functional.silu,
-        #     -1: torch.tanh,
-        # }
-        # act_gates = {
-        #     1: torch.sigmoid,
-        #     -1: torch.tanh,
-        # }
+        act = {
+            1: torch.nn.functional.silu,
+            -1: torch.tanh,
+        }
+        act_gates = {
+            1: torch.sigmoid,
+            -1: torch.tanh,
+        }
 
         if self.node_attr_emb_dim:
             assert self.node_attr_n_kind is not None
             self.node_attr_emb = nn.Embedding(self.node_attr_n_kind, self.node_attr_emb_dim)
 
         self.layers = torch.nn.ModuleList()
-        # self.layers.append(
-        #     Attention(
-        #         irreps,
-        #         self.irreps_query,
-        #         self.irreps_key,
-        #         self.irreps_hidden,  # value self.irreps_value,
-        #         self.irreps_node_attr,
-        #         self.irreps_edge_attr,
-        #         number_of_edge_features,
-        #         radial_layers,
-        #         radial_neurons,
-        #     )
-        # )
         for _ in range(layers):
-            # irreps_scalars = o3.Irreps(
-            #     [
-            #         (mul, ir)
-            #         for mul, ir in self.irreps_hidden
-            #         if ir.l == 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
-            #     ]
-            # )
-            # irreps_gated = o3.Irreps(
-            #     [
-            #         (mul, ir)
-            #         for mul, ir in self.irreps_hidden
-            #         if ir.l > 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
-            #     ]
-            # )
-            # ir = "0e" if tp_path_exists(irreps, self.irreps_edge_attr, "0e") else "0o"
-            # irreps_gates = o3.Irreps([(mul, ir) for mul, _ in irreps_gated])
+            irreps_scalars = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in self.irreps_hidden
+                    if ir.l == 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
+                ]
+            )
+            irreps_gated = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in self.irreps_hidden
+                    if ir.l > 0 and tp_path_exists(irreps, self.irreps_edge_attr, ir)
+                ]
+            )
+            ir = "0e" if tp_path_exists(irreps, self.irreps_edge_attr, "0e") else "0o"
+            irreps_gates = o3.Irreps([(mul, ir) for mul, _ in irreps_gated])
 
-            # gate = Gate(
-            #     irreps_scalars,
-            #     [act[ir.p] for _, ir in irreps_scalars],  # scalar
-            #     irreps_gates,
-            #     [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
-            #     irreps_gated,  # gated tensors
-            # )
-            att = Attention(
+            gate = Gate(
+                irreps_scalars,
+                [act[ir.p] for _, ir in irreps_scalars],  # scalar
+                irreps_gates,
+                [act_gates[ir.p] for _, ir in irreps_gates],  # gates (scalars)
+                irreps_gated,  # gated tensors
+            )
+            att = MultiHeadGraphAttention(
                 irreps,
                 self.irreps_query,
                 self.irreps_key,
-                self.irreps_hidden,  # gate.irreps_in,  # value self.irreps_value,
+                gate.irreps_in,  # self.irreps_gated,  # gate.irreps_in,  # value self.irreps_value,
                 self.irreps_node_attr,
                 self.irreps_edge_attr,
                 number_of_edge_features,
                 radial_layers,
                 radial_neurons,
+                n_heads,
             )
-            irreps = self.irreps_hidden
-            self.layers.append(att)
-            # irreps = gate.irreps_out
-            # self.layers.append(Compose(att, gate))
+            # irreps = self.irreps_hidden
+            # self.layers.append(att)
+            irreps = gate.irreps_out
+            self.layers.append(Compose(att, gate))
 
-        self.att_lay = Attention(
+        # sc = FullyConnectedTensorProduct(
+        #     irreps,
+        #     irreps,
+        #     self.irreps_hidden,
+        # )
+
+        self.hidden = FullyConnectedTensorProduct(
             irreps,
-            self.irreps_query,
-            self.irreps_key,
-            self.irreps_out,
             self.irreps_node_attr,
-            self.irreps_edge_attr,
-            number_of_edge_features,
-            radial_layers,
-            radial_neurons,
-            layer_normalize=False,
+            self.irreps_hidden,
         )
+        self.output_layer = FullyConnectedTensorProduct(self.irreps_hidden, self.irreps_node_attr, self.irreps_out)
+
+        # self.mlp_layers.append(nn.Linear(self.irreps_hidden.dim, self.irreps_out.dim))
 
     def forward(
         self,
         data: Dict[str, torch.Tensor],
+        topology: Dict[str, torch.Tensor],
+        pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """evaluate the network
 
@@ -460,11 +415,14 @@ class Network(torch.nn.Module):
         data : `torch_geometric.data.Data` or dict
             data object containing
             - ``pos`` the position of the nodes (atoms)
+            - ``batch`` the graph to which the node belong, optional
+        topology: `torch_geometric.data.Data` or dict
             - ``x`` the input features of the nodes, optional
             - ``z`` the attributes of the nodes, for instance the atom type, optional
-            - ``batch`` the graph to which the node belong, optional
         """
-        pos = data["pos"]
+        topology = topology.to(data["pos"].device)
+        if pos is None:
+            pos = data["pos"]
         if "batch" in data:
             batch = data["batch"]
         else:
@@ -491,20 +449,25 @@ class Network(torch.nn.Module):
 
         if self.input_has_node_in:
             assert self.irreps_in is not None
-            if "x" in data:
-                x = data["x"]
-            else:
+            if "x" in topology:
+                x = topology["x"]
+            elif self.irreps_in == o3.Irreps("1o"):
                 x = data["pos"]
         else:
             assert self.irreps_in is None
             x = pos.new_ones((pos.shape[0], 1))
 
-        if self.input_has_node_attr and "z" in data and self.node_attr_emb_dim:
-            z = self.node_attr_emb(data["z"])
+        if self.input_has_node_attr and "z" in topology and self.node_attr_emb_dim:
+            z = self.node_attr_emb(topology["z"])
+
             z = torch.squeeze(z)
+            if "esm" in topology:
+                z = torch.cat((topology["esm"], z), dim=1)
         else:
             assert self.irreps_node_attr == o3.Irreps("0e")
             z = pos.new_ones((pos.shape[0], 1))
+
+        z = torch.cat([z] * (len(x) // len(z)))
 
         scalar_z = self.ext_z(z)
         edge_features = torch.cat([edge_length_embedded, scalar_z[edge_src], scalar_z[edge_dst]], dim=1)
@@ -520,15 +483,10 @@ class Network(torch.nn.Module):
                 edge_weight_cutoff,
             )
 
-        x = self.att_lay(
-            x,
-            z,
-            edge_src,
-            edge_dst,
-            edge_sh,
-            edge_features,
-            edge_weight_cutoff,
-        )
+        x = self.hidden(x, z)
+        x = self.output_layer(x, z)
+        # x = x + pos
+
         # if t is not None:
         #      x = x * (1 + scale) + shift
         # self.layers[-1]
@@ -540,25 +498,28 @@ class Network(torch.nn.Module):
 
 
 class e3nn_md_module(L.LightningModule):
+
     def __init__(
         self,
-        lr=1e-4,
+        topology: Dict[str, torch.Tensor],
+        init_lr=1e-4,
         **model_kwargs: Dict,
     ) -> None:
         """_summary_
 
         Parameters
         ----------
-        weight_fill : float, optional
-            _description_, by default 0.005
+        init_lr : float, optional
+            initial learning rate, by default 0.0001
         """
         super().__init__()
         self.save_hyperparameters()
+        self.topology = topology
 
         # self.weight_fill = weight_fill
         self.model = Network(**model_kwargs)
 
-        self.lr = lr
+        self.init_lr = init_lr
 
     #     if init_weight:
     #         self._init_model()
@@ -571,6 +532,8 @@ class e3nn_md_module(L.LightningModule):
     def forward(
         self,
         data: Dict[str, torch.Tensor],
+        # topology: Dict[str, torch.Tensor],
+        pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """evaluate the network
 
@@ -584,17 +547,16 @@ class e3nn_md_module(L.LightningModule):
             - ``y`` the target, optional
             - ``batch`` the graph to which the node belong, optional
         """
-        results = self.model(data)
+        results = self.model(data, self.topology, pos)
         return results
 
     def _get_loss(self, data):
-        # pos = data["pos"]
 
         prediction = self(data)
         return F.mse_loss(data["y"], prediction)
 
     def configure_optimizers(self) -> Dict:
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), weight_decay=0.01, lr=self.init_lr)
         # Using a scheduler is optional but can be helpful.
         # The scheduler reduces the LR if the validation performance hasn't improved for the last N epochs
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
