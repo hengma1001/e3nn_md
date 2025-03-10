@@ -10,18 +10,24 @@ from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
+from e3nn_md.esm_embed.embedding import ESM_embedder
 
-def parse_traj(traj_path, top_path, sel="protein and not name H*"):
+
+def parse_traj(traj_path, top_path, embedder=True, sel="protein and not name H*"):
     data = {}
     data["sys_name"] = os.path.basename(top_path)
 
     mda_u = mda.Universe(top_path, traj_path)
-    protein_noH = mda_u.select_atoms(sel)
-    data["res_atom_name"] = [atom.resname + atom.name for atom in protein_noH.atoms]
+    atmgrp_selected = mda_u.select_atoms(sel)
+    data["res_atom_name"] = [atom.resname + atom.name for atom in atmgrp_selected.atoms]
+    if embedder:
+        embedder = ESM_embedder()
+        esm_embeddings = embedder.cal_embedding(top_path)
+        data["esm_embedding"] = [esm_embeddings[atom.resindex] for atom in atmgrp_selected.atoms]
 
-    positions = np.zeros((mda_u.trajectory.n_frames, protein_noH.n_atoms, 3))
+    positions = np.zeros((mda_u.trajectory.n_frames, atmgrp_selected.n_atoms, 3))
     for ts in mda_u.trajectory:
-        positions[ts.frame] = protein_noH.positions / 10  # convert to nm
+        positions[ts.frame] = (atmgrp_selected.positions - atmgrp_selected.center_of_mass()) / 10  # convert to nm
     data["pos"] = torch.Tensor(positions)
     return data
 
@@ -37,17 +43,22 @@ def dbs_to_torch(dbs):
     label_encoder = preprocessing.LabelEncoder()
     label_encoder.fit(full_voca)
 
+    data = dbs[0]
+    topology = torch_geometric.data.Data(
+        z=torch.from_numpy(label_encoder.transform(data["res_atom_name"])).reshape(-1, 1),
+        esm=torch.stack(data["esm_embedding"]),
+    )
+
     dbs_refined = []
     for data in tqdm(dbs):
-        for j in tqdm(range(len(data["pos"]) - 1)):
+        for i in tqdm(range(len(data["pos"]) - 1)):
             frame_data = torch_geometric.data.Data(
-                pos=data["pos"][j],
-                y=data["pos"][j + 1],
-                z=torch.from_numpy(label_encoder.transform(data["res_atom_name"]).reshape(-1, 1)),
+                pos=data["pos"][i],
+                y=kabsch_torch(data["pos"][i + 1], data["pos"][i]) - data["pos"][i],
                 sys_name=data["sys_name"],
             )
             dbs_refined.append(frame_data)
-    return dbs_refined, full_voca_size, label_encoder
+    return topology, dbs_refined, full_voca_size, label_encoder
 
 
 def dbs_split(dbs, split_ratio=[0.7, 0.2, 0.1], shuffle=True, random_seed=0, batch_size=64):
@@ -62,6 +73,55 @@ def dbs_split(dbs, split_ratio=[0.7, 0.2, 0.1], shuffle=True, random_seed=0, bat
     test = torch_geometric.loader.DataLoader(test, batch_size=batch_size)
 
     return train, val, test
+
+
+def write_pdb(pdb_file, positions, output_pdb, sel_str="protein and name CA"):
+    mda_u = mda.Universe(pdb_file)
+    atmgrp_sel = mda_u.select_atoms(sel_str)
+    atmgrp_sel.positions = positions
+    atmgrp_sel.write(output_pdb)
+
+
+def kabsch_torch(P, Q):
+    """
+    Computes the optimal rotation and translation to align two sets of points (P -> Q),
+    and their RMSD.
+    :param P: A Nx3 matrix of points
+    :param Q: A Nx3 matrix of points
+    :return: A tuple containing the optimal rotation matrix, the optimal
+             translation vector, and the RMSD.
+    """
+    assert P.shape == Q.shape, "Matrix dimensions must match"
+
+    # Compute centroids
+    centroid_P = torch.mean(P, dim=0)
+    centroid_Q = torch.mean(Q, dim=0)
+
+    # Optimal translation
+    t = centroid_Q - centroid_P
+
+    # Center the points
+    p = P - centroid_P
+    q = Q - centroid_Q
+
+    # Compute the covariance matrix
+    H = torch.matmul(p.transpose(0, 1), q)
+
+    # SVD
+    U, S, Vt = torch.linalg.svd(H)
+
+    # Validate right-handed coordinate system
+    if torch.det(torch.matmul(Vt.transpose(0, 1), U.transpose(0, 1))) < 0.0:
+        Vt[:, -1] *= -1.0
+
+    # Optimal rotation
+    R = torch.matmul(Vt.transpose(0, 1), U.transpose(0, 1))
+
+    return torch.matmul(p, R.transpose(0, 1))
+    # RMSD
+    rmsd = torch.sqrt(torch.sum(torch.square(torch.matmul(p, R.transpose(0, 1)) - q)) / P.shape[0])
+
+    return R, t, rmsd
 
 
 # def pdbs_to_datasets(comp_paths, split_ratio=[0.7, 0.2, 0.1], **kwargs):
